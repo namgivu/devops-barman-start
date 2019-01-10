@@ -99,4 +99,3 @@ backup_method   = postgres
 # backup_method = rsync
 " > /etc/barman.d/pg.conf
 ```
-
