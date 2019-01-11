@@ -132,7 +132,8 @@ archive_command = 'rsync -a  %p                      barman@backup:/var/lib/barm
 restart postgres instance
 eg.
 ```bash
-sudo systemctl restart postgresql-9.4.service
+you@pg $ sudo systemctl restart postgresql-9.4.service #TODO which working for ubuntu?
+you@pg $ sudo /etc/init.d/postgresql restart           #TODO which working for ubuntu?
 ```
 
 # aftermath test for Barman setup
@@ -147,5 +148,64 @@ some often-seen issue
 * ssh not working between servers
 * etc.
 
-TODO continue from https://www.digitalocean.com/community/tutorials/how-to-back-up-restore-and-migrate-postgresql-databases-with-barman-on-centos-7#step-8-—-creating-the-first-backup
-sample for create backup & do restore
+# sample create backup 
+```bash
+barman@backup $ barman backup "$instance_name"
+```
+
+backup file will be created at **/var/lib/barman**
+```bash
+barman@backup $ ls /var/lib/barman
+# /var/lib/barman   /base       # base backup file stored here
+# /var/lib/barman   /incoming   # completed wal files sent here
+# /var/lib/barman   /wals       # files here copied from :incoming 
+```
+
+> During a restoration, Barman will recover contents in **base** into the target server's **data directory** 
+  Then files in **wals** folder are used to apply transaction changes and bring the target server to a consistent state.
+
+view backup info
+```bash
+barman@backup $ barman list-backup "$instance_name"              # list backup ids
+barman@backup $ barman show-backup "$instance_name" "$backup_id" # view backup detail by id
+barman@backup $ barman list-files  "$instance_name" "$backup_id" # list base+wal files of :backup_id
+```
+sample output
+>    :backup_id        :created_at                :base_size       :wal_size
+> pg 20151111T051954 - Wed Nov 11 05:19:46 2015 - Size: 26.9 MiB - WAL Size: 0 B
+
+# run backup as scheduled
+backups should happen automatically on a schedule
+open crontab file
+```bash
+barman@backup $ crontab -e
+```
+add below file
+```crontab
+30 23 * * * /usr/bin/barman backup $instance_name_here  # run backup every night at 1130PM
+*  *  * * * /usr/bin/barman cron                        # very minute, perform maintenance on base and wal files
+```
+
+# sample restore
+stop postgres
+```bash
+postgres@pg $ sudo /etc/init.d/postgresql stop
+```
+
+do restore
+```bash
+# list latest barman's backup
+barman@backup $ barman show-backup "$instance_name" latest # we have :backup_id here
+
+# restore from 
+barman@backup $ barman recover --target-time "Begin time" \                          # use the begin time from the show-backup command
+                               --remote-ssh-command "ssh postgres@$instance_name" \   
+                               "$instance_name" "$backup-id" \   
+                               /var/lib/pgsql/9.4/data  # path where you want the backup to be restored; retrieved by `ssh $instance_name 'echo $PGDATA' `
+#TODO find a less-verbose command to replace the above
+```
+
+start postgres back
+```bash
+postgres@pg $ sudo /etc/init.d/postgresql start
+```
