@@ -28,8 +28,7 @@ you@pg $ sudo adduser barman # enter password when prompted
 create barman as postgres superuser @pg
 ```bash
 you@pg $ sudo su postgres
-postgres@pg $ createuser -s -P barman # enter password when prompted
-postgres@pg $ psql -c 'ALTER USER barman WITH superuser;'
+postgres@pg $ createuser -s -W barman # enter password when prompted; -s for superuser; -W for password prompt
 ```
 
 in case you need to drop barman@pg:psql

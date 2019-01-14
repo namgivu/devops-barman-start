@@ -5,6 +5,7 @@ naming note
 `backup`   as host name where Barman is located
 `barman`   as the user running Barman on the backup server (identified by the parameter barman_user in the configuration)
 `postgres` as the user running PostgreSQL on the pg serve
+$xxx       is value placeholder requiring us to fill in concrete values
 
 :pg_dump will backup only the :db at the time we run :pg_dump
 the gap between the two backup times will be lost
@@ -14,37 +15,59 @@ the right solution to do backup is this
   and the *WAL files*
 
 WAL files contain lists of CRUD transactions that happen to a db
-the actual data contained in db files located in the *data directory*
-
+the actual data contained in db files located in the **data directory** ie. $PGDATA
+eg. PGDATA=/var/lib/postgresql/data
 
 when restoring, PostgreSQL `restores the contents of the data directory first`, 
 and `then plays the transactions on top of it from the WAL files`
 
 normally DBAs would write own backup scripts and scheduled cron jobs to implement backup & restore
-*Barman does this in a standardized way*
+**Barman helps to do this in a standardized way**
 
+install Barman
+```bash
+sudoer@backup $ sudo apt install -y barman
+```
+Barman's home will be at **/var/lib/barman/**
+
+postgres config file at **pg_hba.conf** eg. /etc/postgresql/$version/main/pg_hba.conf
+make postgres on `pg` accept any connection coming from Barman server `backup`
+> host    all             all             $backup_ip/32    trust
+
+bash util
+```bash
+echo "
+
+# my barman config
+host    all             all             $backup_ip/32    trust
+" | tee -a /etc/postgresql/$version/main/pg_hba.conf
+
+```
+
+related servers in the flow
 server 01 aka. `pg`      - main postgres instance
-server 02 aka. `standby` - standby postgres instance
+server 02 aka. `standby` - standby postgres instance used for failed-over for `pg`
 server 03 aka. `backup`  - barman backup space
 
-need :postgres, :barman, and :sudoer user to proceed
-
-Barman will be installed to **/var/lib/barman/**
-config at file **pg_hba.conf** eg. /etc/postgresql/$version/main/pg_hba.conf
-this make postgres on `backup` to accept any connection coming from the Barman server
-> host    all     all     barman-backup-server-ip/32        trust
+related user in the flow
+:postgres@pg, :barman@backup, :sudoer on all servers to switch among the roles
 
 required connections
-* psql - barman @ backup  -->  postgres @ pg+standby
-* ssh  - barman @ backup  <->  postgres @ pg+standby
+* psql - barman@backup  -->  postgres@pg+standby 
+* ssh  - barman@backup  <->  postgres@pg+standby # setup detail in doc/effort-0th.md
 
-test connections
+test psql connection
 ```bash
-postgres@pg      $ ssh barman@backup
-postgres@standby $ ssh barman@backup
-barman@backup    $ ssh postgres@pg
-barman@backup    $ ssh postgres@standby
+barman@backup $ psql -c 'SELECT version()' -U barman -h $pg postgres
 ```
+
+test ssh connections - all below must go thru 
+barman@backup <-> postgres@pg
+```bash
+barman@backup $ ssh postgres@pg
+postgres@pg   $ ssh barman@backup
+```
+same for barman@backup <-> postgres@standby
 
 Barman's main config file at **/etc/barman.conf**
 global config + per-postgres-instance config
@@ -58,6 +81,7 @@ here we put all in /etc/barman.conf
 barman@backup $ sudo nano /etc/barman.conf
 ```
 where we config as below
+TODO reuse_backup not found
 ```conf
 [barman]
 compression  = gzip
@@ -108,6 +132,37 @@ retention_policy      = RECOVERY WINDOW OF 7 days
 wal_retention_policy  = main
 retention_policy_mode = auto
 ```
+
+bash util
+```bash
+sudoer@backup $ echo "
+
+;region my barman config
+compression  = gzip
+reuse_backup = link         
+immediate_checkpoint = true 
+
+basebackup_retry_times = 3  
+basebackup_retry_sleep = 30 
+
+last_backup_maximum_age = 1 DAYS             
+retention_policy = RECOVERY WINDOW OF 7 days
+
+
+[pg]
+description = main postgres instance
+
+ssh_command = ssh postgres@pg
+conninfo    = host=pg user=postgres
+
+retention_policy      = RECOVERY WINDOW OF 7 days
+wal_retention_policy  = main
+retention_policy_mode = auto
+ 
+archiver = on
+;endregion my barman config
+" | sudo tee -a /etc/barman.conf
+```
           
 # last config - switch on backup for the postgres instance
 locate backup folder
@@ -117,23 +172,35 @@ barman@pg $ barman show-server "$instance_name" | grep incoming_wals_directory
 sample output
 > incoming_wals_directory: /var/lib/barman/$instance_name/incoming
 
+open :postgresql.conf to edit
 ```bash
-postgres@pg $ nano "$PGDATA/postgresql.conf" # eg. PGDATA=/var/lib/postgresql/data
+postgres@pg $ psql -U postgres -c 'show config_file' # we got postgresql.conf location eg. /etc/postgresql/10/main/postgresql.conf
+postgres@pg $ nano /etc/postgresql/10/main/postgresql.conf 
 ```
-we config postgres to turn on backup/archive mode as below
+in this file, we config postgres to turn on backup/archive mode as below
 ```conf
-wal_level    = archive # choices eg. minimal, archive, hot_standby, or logical #TODO what these values mean
-archive_mode = on
+wal_level = archive # choices eg. minimal, archive, hot_standby, or logical #TODO what these values mean
 
+archive_mode = on
 archive_command = 'rsync -a  %p                      barman@backup:/var/lib/barman/$instance_name/incoming/%f' # command to use to archive a logfile segment
                              ;from local wal files   ;copied to remote path      
 ```
 
-restart postgres instance
-eg.
+bash util
 ```bash
-you@pg $ sudo systemctl restart postgresql-9.4.service #TODO which working for ubuntu?
-you@pg $ sudo /etc/init.d/postgresql restart           #TODO which working for ubuntu?
+postgres@pg $ echo "
+
+#region my barman config
+wal_level = archive 
+archive_mode = on
+archive_command = 'rsync -a  %p  barman@backup:/var/lib/barman/$instance_name/incoming/%f' 
+#endregion
+" | tee -a /etc/postgresql/10/main/postgresql.conf
+```
+
+restart postgres instance
+```bash
+sudoer@pg $ sudo /etc/init.d/postgresql restart
 ```
 
 # aftermath test for Barman setup
@@ -143,10 +210,32 @@ barman@backup $ barman check "$instance_name"
 ```
 you may have "backup maximum age FAILED state" when having blank backup files
 some often-seen issue
-* barman@backup not able to log in :pg instance
-* postgres instance :pg not done-configured for WAL archiving
 * ssh not working between servers
+* barman@backup not able to psql-log-in :pg server
+* postgres instance :pg incomplete configure for WAL archiving
 * etc.
+
+
+## check Barman's :incoming_wals_directory vs postgresql.conf's :archive_command
+in postgresql.conf we have :archive_command
+> archive_command = 'rsync -a %p barman@backup:INCOMING_WALS_DIRECTORY/%f' 
+
+we must have :INCOMING_WALS_DIRECTORY same value with
+             :incoming_wals_directory returned in `barman show-server pg`
+
+bash util to check  
+```bash
+barman@backup $ barman show-server pg | grep incoming_wals_directory
+# output1
+# > incoming_wals_directory: /var/lib/barman/pg/incoming
+
+postgres@pg $ cat /etc/postgresql/10/main/postgresql.conf | grep archive_command
+# output2
+# > archive_command = 'rsync -a  %p  barman@staging:/var/lib/barman/staging/incoming/%f' 
+```
+
+we must have same path in :output1 and :output2
+
 
 # sample create backup 
 ```bash
